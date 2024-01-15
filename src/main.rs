@@ -1,15 +1,22 @@
 use anyhow::{Ok, Result};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Datelike, Weekday, NaiveTime};
 use serde::Deserialize;
-use std::{fs::File, io::BufReader, ops::Add};
+use std::{fs::File, io::BufReader, ops::Add, collections::HashSet};
 
-// Defines the signature for the function to define the price for a single datapoint for a plan
+// Defines the signature for the functions to define the price for a plan
 trait PricePlanStrategy {
     fn price_for_singe_period(&self, datapoint: &SmartMeterData) -> EnergyBillEntry;
     fn standing_charge_per_day(&self) -> EnergyBillEntry;
+    fn standing_charge_per_number_of_days(&self, days: u32) -> EnergyBillEntry {
+        match self.standing_charge_per_day() {
+            EnergyBillEntry::Credit(_) => panic!("we shouldnever get credit per dau"),
+            EnergyBillEntry::Debit(day_value) => EnergyBillEntry::Debit(day_value * days as f32),
+        }
+        
+    }
 }
 
-fn compute_total_bill_for_perio<T>(
+fn compute_total_bill_for_period<T>(
     datapoints: &Vec<SmartMeterData>,
     price_plan: &T,
 ) -> EnergyBillEntry
@@ -21,7 +28,6 @@ where
         .fold(EnergyBillEntry::Debit(0.0), |acc, d| {
             let price_for_singe_period = price_plan.price_for_singe_period(d);
             let energy_bill_entry = acc + price_for_singe_period;
-            println!("{acc:?} + {price_for_singe_period:?} = {energy_bill_entry:?}");
             energy_bill_entry
         })
 }
@@ -41,6 +47,74 @@ impl PricePlanStrategy for ElectricIrelandHomeElectric14 {
 
     fn standing_charge_per_day(&self) -> EnergyBillEntry {
         EnergyBillEntry::Debit(272.61 / 365f32)
+    }
+}
+
+struct BordGaisEnergy25WeekendFree;
+impl PricePlanStrategy for BordGaisEnergy25WeekendFree {
+    /**
+        Urban Day units (8am to 11pm)    43.04 35.30 cent per kWh
+        Urban Peak units (5pm to 7pm)    52.58 43.12 cent per kWh
+        Urban Night units (11pm to 8am)  31.63 25.94 cent per kWh
+        Annual Standing Charge           €237.56
+    */
+    fn price_for_singe_period(&self, datapoint: &SmartMeterData) -> EnergyBillEntry {
+        const FREE_ENERGY_START_TIME: NaiveTime = match NaiveTime::from_hms_opt(9, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+        const FREE_ENERGY_END_TIME: NaiveTime = match NaiveTime::from_hms_opt(18, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+
+        const PEAK_ENERGY_START_TIME: NaiveTime = match NaiveTime::from_hms_opt(17, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+        const PEAK_ENERGY_END_TIME: NaiveTime = match NaiveTime::from_hms_opt(19, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+
+        const NIGHT_ENERGY_START_TIME: NaiveTime = match NaiveTime::from_hms_opt(23, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+        const NIGHT_ENERGY_END_TIME: NaiveTime = match NaiveTime::from_hms_opt(8, 0, 0) {
+            Some(t) => t,
+            None => panic!("Must be a valid time"),
+        };
+
+        const WEEKDAYS: [Weekday; 5] = [Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri];
+        match datapoint.read_type {
+            SmartMeterDataType::ActiveImport => {
+                // treat the sunday special case
+                // free from 9am to 5pm
+                // no peak time on weekends
+                if datapoint.read_data_and_end_time.weekday() == Weekday::Sun 
+                && datapoint.read_data_and_end_time.time() > FREE_ENERGY_START_TIME
+                && datapoint.read_data_and_end_time.time() <= FREE_ENERGY_END_TIME {
+                    EnergyBillEntry::Debit(0.0)
+                } else if WEEKDAYS.contains(&datapoint.read_data_and_end_time.weekday())
+                &&  datapoint.read_data_and_end_time.time() > PEAK_ENERGY_START_TIME
+                && datapoint.read_data_and_end_time.time() <= PEAK_ENERGY_END_TIME {
+                    EnergyBillEntry::Debit(0.5258 * (1.0 - 0.25) * datapoint.read_value)
+                } else if datapoint.read_data_and_end_time.time() > NIGHT_ENERGY_START_TIME
+                && datapoint.read_data_and_end_time.time() <= NIGHT_ENERGY_END_TIME {
+                    EnergyBillEntry::Debit(0.3163 * (1.0 - 0.25) * datapoint.read_value)
+                }else {
+                    EnergyBillEntry::Debit(0.4304 * (1.0 - 0.25) * datapoint.read_value)
+                }
+            }
+            SmartMeterDataType::ActiveExport => {
+                EnergyBillEntry::Credit(0.185 * datapoint.read_value)
+            }
+        }
+    }
+
+    fn standing_charge_per_day(&self) -> EnergyBillEntry {
+        EnergyBillEntry::Debit(237.56 / 365f32)
     }
 }
 
@@ -131,7 +205,7 @@ struct SmartMeterData {
 }
 
 fn main() -> Result<()> {
-    const FILENAME: &str = "data/HDF_reduced.csv";
+    const FILENAME: &str = "data/HDF_10308375697_09-01-2024.csv";
     let f = File::open(FILENAME)?;
     let reader = BufReader::new(f);
     // Build the CSV reader and iterate over each record.
@@ -140,7 +214,10 @@ fn main() -> Result<()> {
         .from_reader(reader);
     let data: Vec<SmartMeterData> = rdr.deserialize().flat_map(|x| x).collect();
 
-    let total = compute_total_bill_for_perio(&data, &ElectricIrelandHomeElectric14);
-    println!("{total:?}");
+    let total = compute_total_bill_for_period(&data, &ElectricIrelandHomeElectric14) + ElectricIrelandHomeElectric14.standing_charge_per_number_of_days(300);
+    println!("ElectricIrelandHomeElectric14: {total:?}");
+
+    let total = compute_total_bill_for_period(&data, &BordGaisEnergy25WeekendFree) + BordGaisEnergy25WeekendFree.standing_charge_per_number_of_days(300);
+    println!("BordGaisEnergy25WeekendFree: {total:?}");
     Ok(())
 }
